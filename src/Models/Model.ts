@@ -8,6 +8,8 @@ export class User extends Model<InferAttributes<User>, InferCreationAttributes<U
 	declare email_verified: boolean;
 	declare verfication_token: string | null;
 	declare verfication_token_expiress: Date | null;
+	declare resetPasswordTokenHash: string | null;
+	declare resetPasswordTokenExpires: Date | null;
 	declare username: string;
 	declare adminNo: string;
 	declare passwordHash: string;
@@ -22,6 +24,8 @@ User.init(
 		email_verified: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
 		verfication_token: { type: DataTypes.TEXT, allowNull: true, unique: true },
 		verfication_token_expiress: { type: DataTypes.DATE, allowNull: true },
+		resetPasswordTokenHash: { type: DataTypes.STRING(64), allowNull: true, unique: true },
+		resetPasswordTokenExpires: { type: DataTypes.DATE, allowNull: true },
 		username: { type: DataTypes.STRING(50), allowNull: false, unique: true },
 		adminNo: { type: DataTypes.STRING(4), allowNull: false, unique: true },
 		passwordHash: { type: DataTypes.STRING(255), allowNull: false },
