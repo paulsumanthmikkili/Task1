@@ -1,10 +1,37 @@
 import argon2 from 'argon2';
 import { Op } from 'sequelize';
 import { Request, Response } from 'express';
-import { RefreshToken,signToken, AuthenticatedRequest } from '../Authentication/Auth';
+import { RefreshToken, signToken, AuthenticatedRequest, validatePassword } from '../Authentication/Auth';
 import { User } from '../Models/Model';
 import crypto from 'crypto';
-import { Mail } from '../MailValidation/Mail';
+import { enqueuePasswordChangedEmail, enqueuePasswordResetEmail, enqueueVerificationEmail } from '../Queues/emailQueue';
+import {createClient} from 'redis';
+import { requestLoginApproval, terminateUserSessionSockets } from '../Authentication/Session';
+import { PendingLogin } from '../Models/Model';
+import sequelize from '../Config/db';
+import { micro } from '../microServices/micro';
+
+const client = createClient({ url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379' });
+client.connect().then((res)=>console.log(`redis connected sucessfully`,res)).catch((err)=>console.log(`failed to connect redis`,err));
+
+const USER_CACHE_TTL_SECONDS = 60;
+
+async function refreshUserCache(user: User): Promise<void> {
+	const serializedUser = user.toJSON();
+	await client.set(`user:${user.id}`, JSON.stringify(serializedUser), { EX: USER_CACHE_TTL_SECONDS });
+	await client.del('user');
+
+	const cachedData = await client.get('data');
+	if (cachedData) {
+		const users = JSON.parse(cachedData) as Array<{ id: number }>;
+		const userIndex = users.findIndex((cachedUser) => cachedUser.id === user.id);
+		if (userIndex !== -1) {
+			users[userIndex] = serializedUser;
+			await client.set('data', JSON.stringify(users), { EX: USER_CACHE_TTL_SECONDS });
+		}
+	}
+}
+
 
 export function verificationToken(): string {
 	return crypto.randomBytes(32).toString('hex');
@@ -57,16 +84,18 @@ export async function registerController(req: Request, res: Response): Promise<v
 		verfication_token_expiress: new Date(Date.now() + 15 * 60 * 1000),
 	});
 
-	let emailSent = false;
 	try {
-		await Mail(user.email, verificationTokenValue, user.name);
-		emailSent = true;
+		await enqueueVerificationEmail({
+			email: user.email,
+			verificationToken: verificationTokenValue,
+			name: user.name,
+		});
 	} catch (error: unknown) {
-		console.error('Email verification send failed:', error);
+		console.error('Email verification enqueue failed:', error);
 		await user.destroy();
 		res.status(502).json({
 			success: false,
-			message: 'Registration could not be completed because the verification email could not be sent.',
+			message: 'Registration could not be completed because the verification email could not be queued.',
 		});
 		return;
 	}
@@ -75,7 +104,7 @@ export async function registerController(req: Request, res: Response): Promise<v
 		status: 'success',
 		success: true,
 		message: 'Registration successful. Please verify your email before logging in.',
-		emailSent,
+		emailQueued: true,
 	});
 }
 
@@ -107,13 +136,17 @@ export async function loginController(req: Request, res: Response): Promise<void
 		await user.save();
 
 		try {
-			await Mail(user.email, newVerificationToken, user.name);
+			await enqueueVerificationEmail({
+				email: user.email,
+				verificationToken: newVerificationToken,
+				name: user.name,
+			});
 		} catch (error: unknown) {
-			console.error('Email verification resend failed:', error);
+			console.error('Email verification enqueue failed:', error);
 			res.status(502).json({
 				status: 'failed',
 				success: false,
-				message: 'Your email is not verified, and the verification email could not be sent.',
+				message: 'Your email is not verified, and the verification email could not be queued.',
 			});
 			return;
 		}
@@ -121,22 +154,339 @@ export async function loginController(req: Request, res: Response): Promise<void
 		res.status(403).json({
 			status: 'failed',
 			success: false,
-			message: 'Your email is not verified. A new verification email has been sent.',
-			emailSent: true,
+			message: 'Your email is not verified. A new verification email has been queued.',
+			emailQueued: true,
 		});
 		return;
 	}
+	const requestedSessionId = crypto.randomUUID();
+	const loginRequest = await sequelize.transaction(async (transaction) => {
+		const currentUser = await User.findByPk(user.id, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!currentUser) {
+			return { kind: 'missing' as const };
+		}
+
+		if (currentUser.currentSessionId) {
+			const pending = await PendingLogin.create({
+				id: crypto.randomUUID(),
+				userId: currentUser.id,
+				activeSessionId: currentUser.currentSessionId,
+				requestedSessionId,
+				status: 'pending',
+				expiresAt: new Date(Date.now() + 2 * 60 * 1000),
+			}, { transaction });
+			return { kind: 'pending' as const, pending };
+		}
+
+		currentUser.currentSessionId = requestedSessionId;
+		await currentUser.save({ transaction });
+		return { kind: 'login' as const, currentUser };
+	});
+
+	if (loginRequest.kind === 'missing') {
+		res.status(404).json({ status: 'failed', success: false, message: 'User not found.' });
+		return;
+	}
+
+	if (loginRequest.kind === 'pending') {
+		requestLoginApproval(user.id, loginRequest.pending.activeSessionId, {
+			requestId: loginRequest.pending.id,
+			expiresAt: loginRequest.pending.expiresAt,
+		});
+		res.status(202).json({
+			status: 'pending',
+			success: true,
+			message: 'Sign-in approval was requested on your active device.',
+			data: { requestId: loginRequest.pending.id, expiresAt: loginRequest.pending.expiresAt },
+		});
+		return;
+	}
+	console.log(signToken(loginRequest.currentUser))
 	res.json({
 		status:"success",
 		success: true,
 		message: 'Login successful.',
-		data: { Acesstoken: signToken(user),RefreshToken:RefreshToken(user) ,user: { id: user.id, adminNo: user.adminNo, name: user.name, email: user.email, username: user.username, isAdmin: user.isAdmin } },
+		data: { Acesstoken: signToken(loginRequest.currentUser),RefreshToken:RefreshToken(loginRequest.currentUser) ,user: { id: loginRequest.currentUser.id, adminNo: loginRequest.currentUser.adminNo, name: loginRequest.currentUser.name, email: loginRequest.currentUser.email, username: loginRequest.currentUser.username, isAdmin: loginRequest.currentUser.isAdmin } },
 	});
+}
+
+export async function loginDecisionController(req: AuthenticatedRequest, res: Response): Promise<void> {
+	const requestId = req.body?.requestId;
+	const decision = req.body?.decision;
+	if (typeof requestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(requestId) ||
+		(decision !== 'grant' && decision !== 'cancel')) {
+		res.status(400).json({ success: false, message: 'A valid requestId and decision ("grant" or "cancel") are required.' });
+		return;
+	}
+
+	const result = await sequelize.transaction(async (transaction) => {
+		const pending = await PendingLogin.findByPk(requestId, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!pending || pending.userId !== req.user!.userId) {
+			return { status: 'not-found' as const };
+		}
+
+		if (pending.status !== 'pending') {
+			return { status: 'already-handled' as const, previousStatus: pending.status };
+		}
+
+		const user = await User.findByPk(pending.userId, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!user || user.currentSessionId !== req.user!.sessionId ||
+			user.currentSessionId !== pending.activeSessionId) {
+			pending.status = 'expired';
+			await pending.save({ transaction });
+			return { status: 'expired' as const };
+		}
+
+		if (pending.expiresAt.getTime() <= Date.now()) {
+			pending.status = 'expired';
+			await pending.save({ transaction });
+			return { status: 'expired' as const };
+		}
+
+		if (decision === 'cancel') {
+			pending.status = 'denied';
+			await pending.save({ transaction });
+			return { status: 'denied' as const };
+		}
+
+		user.currentSessionId = pending.requestedSessionId;
+		await user.save({ transaction });
+		pending.status = 'approved';
+		await pending.save({ transaction });
+		return { status: 'approved' as const, oldSessionId: pending.activeSessionId };
+	});
+
+	if (result.status === 'approved') {
+		terminateUserSessionSockets(req.user!.userId, result.oldSessionId);
+		res.status(200).json({ success: true, status: 'approved', message: 'Sign-in approved. Your current session has been signed out.' });
+		return;
+	}
+	if (result.status === 'not-found') {
+		res.status(404).json({ success: false, status: 'not-found', message: 'Login request not found.' });
+		return;
+	}
+	if (result.status === 'denied') {
+		res.status(200).json({ success: true, status: 'denied', message: 'Sign-in request cancelled.' });
+		return;
+	}
+	if (result.status === 'expired') {
+		res.status(410).json({ success: false, status: 'expired', message: 'Sign-in request expired or is no longer valid.' });
+		return;
+	}
+	res.status(409).json({
+		success: false,
+		status: 'already-handled',
+		requestStatus: result.previousStatus,
+		message: 'Sign-in request has already been handled.',
+	});
+}
+
+export async function loginStatusController(req: Request, res: Response): Promise<void> {
+	const requestId = req.params.requestId;
+	if (typeof requestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(requestId)) {
+		res.status(400).json({ success: false, message: 'A valid login request ID is required.' });
+		return;
+	}
+
+	const pending = await PendingLogin.findByPk(requestId);
+	if (!pending) {
+		res.status(404).json({ success: false, status: 'not-found', message: 'Login request not found.' });
+		return;
+	}
+	if (pending.status === 'pending' && pending.expiresAt.getTime() <= Date.now()) {
+		pending.status = 'expired';
+		await pending.save();
+	}
+
+	if (pending.status === 'approved') {
+		const user = await User.findByPk(pending.userId);
+		if (!user || user.currentSessionId !== pending.requestedSessionId) {
+			res.status(409).json({ success: false, status: 'superseded', message: 'This approved sign-in was replaced by a newer session.' });
+			return;
+		}
+		res.status(200).json({
+			success: true,
+			status: 'approved',
+			message: 'Sign-in approved.',
+			data: {
+				Acesstoken: signToken(user),
+				RefreshToken: RefreshToken(user),
+				user: { id: user.id, adminNo: user.adminNo, name: user.name, email: user.email, username: user.username, isAdmin: user.isAdmin },
+			},
+		});
+		return;
+	}
+
+	if (pending.status === 'pending') {
+		res.status(202).json({ success: true, status: 'pending', expiresAt: pending.expiresAt });
+		return;
+	}
+	res.status(200).json({ success: true, status: pending.status });
 }
 
 export async function dashboardController(req: AuthenticatedRequest, res: Response): Promise<void> {
 	const user = await User.findByPk(req.user!.userId, { attributes: [ 'name' ] });
 	res.json({ success: true, message: 'Dashboard data loaded.', data: { user } });
+}
+
+export async function changePasswordController(req: AuthenticatedRequest, res: Response): Promise<void> {
+	const { oldPassword, newPassword } = req.body as { oldPassword?: unknown; newPassword?: unknown };
+	if (typeof oldPassword !== 'string' || typeof newPassword !== 'string') {
+		res.status(400).json({ success: false, message: 'Old password and new password are required.' });
+		return;
+	}
+	const passwordError = validatePassword(newPassword);
+	if (passwordError) {
+		res.status(400).json({ success: false, message: passwordError });
+		return;
+	}
+
+	const user = await User.findByPk(req.user!.userId);
+	if (!user) {
+		res.status(404).json({ success: false, message: 'User not found.' });
+		return;
+	}
+	if (!(await argon2.verify(user.passwordHash, oldPassword))) {
+		res.status(401).json({ success: false, message: 'Old password is incorrect.' });
+		return;
+	}
+	if (oldPassword === newPassword) {
+		res.status(400).json({ success: false, message: 'New password must be different from the old password.' });
+		return;
+	}
+
+	user.passwordHash = await argon2.hash(newPassword);
+	await user.save();
+	try {
+		await enqueuePasswordChangedEmail({ email: user.email, name: user.name });
+	} catch (error: unknown) {
+		console.error('Password change notification enqueue failed:', error);
+	}
+	res.status(200).json({ success: true, message: 'Password changed successfully.' });
+}
+
+export async function forgotPasswordController(req: Request, res: Response): Promise<void> {
+	const email = typeof req.body?.email === 'string' ? normalizeEmailInput(req.body.email) : '';
+	if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+		res.status(400).json({ success: false, message: 'A valid email is required.' });
+		return;
+	}
+
+	const user = await User.findOne({ where: { email } });
+	if (user) {
+		const resetToken = crypto.randomBytes(32).toString('hex');
+		console.log(resetToken)
+		user.resetPasswordTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+		user.resetPasswordTokenExpires = new Date(Date.now() + 15 * 60 * 1000);
+		await user.save();
+		try {
+			await enqueuePasswordResetEmail({ email: user.email, resetToken, name: user.name });
+		} catch (error: unknown) {
+			console.error('Password reset email enqueue failed:', error);
+			user.resetPasswordTokenHash = null;
+			user.resetPasswordTokenExpires = null;
+			await user.save();
+		}
+	}
+
+	res.status(202).json({ success: true, message: 'If that email is registered, password reset instructions have been sent.' });
+}
+
+export async function resetPasswordController(req: Request, res: Response): Promise<void> {
+	const { token, newPassword } = req.body as { token?: unknown; newPassword?: unknown };
+	if (typeof token !== 'string' || typeof newPassword !== 'string') {
+		res.status(400).json({ success: false, message: 'Reset token and new password are required.' });
+		return;
+	}
+	const passwordError = validatePassword(newPassword);
+	if (passwordError) {
+		res.status(400).json({ success: false, message: passwordError });
+		return;
+	}
+
+	const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+	const user = await User.findOne({ where: { resetPasswordTokenHash: tokenHash } });
+	if (!user || !user.resetPasswordTokenExpires || user.resetPasswordTokenExpires.getTime() < Date.now()) {
+		res.status(400).json({ success: false, message: 'Invalid or expired password reset token.' });
+		return;
+	}
+
+	user.passwordHash = await argon2.hash(newPassword);
+	user.resetPasswordTokenHash = null;
+	user.resetPasswordTokenExpires = null;
+	await user.save();
+	try {
+		await enqueuePasswordChangedEmail({ email: user.email, name: user.name });
+	} catch (error: unknown) {
+		console.error('Password change notification enqueue failed:', error);
+	}
+	res.status(200).json({ success: true, message: 'Password reset successfully.' });
+}
+
+export async function updateUserDetailsController(req: AuthenticatedRequest, res: Response): Promise<void> {
+	const { name, username, email } = req.body as { name?: unknown; username?: unknown; email?: unknown };
+	if (name === undefined && username === undefined && email === undefined) {
+		res.status(400).json({ success: false, message: 'Provide at least one user detail to update.' });
+		return;
+	}
+	if ((name !== undefined && (typeof name !== 'string' || !name.trim() || name.trim().length > 100)) ||
+		(username !== undefined && (typeof username !== 'string' || !/^[a-zA-Z0-9]{3,50}$/.test(username.trim()))) ||
+		(email !== undefined && (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmailInput(email))))) {
+		res.status(400).json({ success: false, message: 'Provide a valid name, username, or email.' });
+		return;
+	}
+
+	const user = await User.findByPk(req.user!.userId);
+	if (!user) {
+		res.status(404).json({ success: false, message: 'User not found.' });
+		return;
+	}
+	const nextUsername = typeof username === 'string' ? username.trim() : undefined;
+	const nextEmail = typeof email === 'string' ? normalizeEmailInput(email) : undefined;
+	if (nextUsername && nextUsername !== user.username && await User.findOne({ where: { username: nextUsername } })) {
+		res.status(409).json({ success: false, message: 'Username is already in use.' });
+		return;
+	}
+	if (nextEmail && nextEmail !== user.email && await User.findOne({ where: { email: nextEmail } })) {
+		res.status(409).json({ success: false, message: 'Email is already in use.' });
+		return;
+	}
+
+	if (typeof name === 'string') user.name = name.trim();
+	if (nextUsername) user.username = nextUsername;
+	const emailChanged = Boolean(nextEmail && nextEmail !== user.email);
+	if (emailChanged && nextEmail) {
+		user.email = nextEmail;
+		user.email_verified = false;
+		user.verfication_token = verificationToken();
+		user.verfication_token_expiress = new Date(Date.now() + 25 * 60 * 1000);
+	}
+	await user.save();
+	await refreshUserCache(user);
+	if (emailChanged) {
+		try {
+			await enqueueVerificationEmail({ email: user.email, verificationToken: user.verfication_token!, name: user.name });
+		} catch (error: unknown) {
+			console.error('Updated email verification enqueue failed:', error);
+			res.status(502).json({ success: false, message: 'Details were updated, but the verification email could not be queued.' });
+			return;
+		}
+	}
+
+	res.status(200).json({
+		success: true,
+		message: emailChanged ? 'User details updated. Verify your new email before logging in.' : 'User details updated successfully.',
+		data: { id: user.id, name: user.name, email: user.email, username: user.username, email_verified: user.email_verified },
+	});
 }
 
 
@@ -173,5 +523,108 @@ export async function verifyEmail(req: Request, res: Response): Promise<void> {
 	res.status(200).json({ success: true, message: 'Email verified successfully.' });
 }
 
+export async function getData(_req: Request, res: Response): Promise<void> {
+	const cachedData = await client.get('data');
+	if (cachedData) {
+		res.status(200).json({
+			msg: 'data getting from redis',
+			data: JSON.parse(cachedData),
+		});
+		return;
+	}
+
+	const data = await User.findAll();
+	await client.set('data', JSON.stringify(data), { EX: USER_CACHE_TTL_SECONDS });
+	res.status(200).json({
+		status: true,
+		msg: 'data fetch from db',
+		data,
+	});
+}
+
+export async function getuserwithid(req: Request, res: Response): Promise<void> {
+	const id = Number(req.params.id);
+	if (!Number.isInteger(id) || id <= 0) {
+		res.status(400).json({ msg: 'A valid user id is required.' });
+		return;
+	}
+
+	const cacheKey = `user:${id}`;
+	const cachedUser = await client.get(cacheKey);
+	if (cachedUser) {
+		res.status(200).json({
+			msg: 'getting data from redis',
+			data: JSON.parse(cachedUser),
+		});
+		return;
+	}
+
+	const data = await User.findByPk(id);
+	if (!data) {
+		res.status(404).json({ msg: 'user not exist' });
+		return;
+	}
+
+	await client.set(cacheKey, JSON.stringify(data), { EX: USER_CACHE_TTL_SECONDS });
+	res.status(200).json({
+		msg: 'getting data from database',
+		data,
+	});
+}
+
+export async function MicroserviceRegisterController(req: Request, res: Response): Promise<void> {
+	const data=await micro();
+	console.log(data)
+	const { name, email, username, password,userType } = data;
+
+	if (typeof password !== 'string') {
+		res.status(400).json({ success: false, message: 'Password is required.' });
+		return;
+	}
+
+	const normalizedEmail = typeof email === 'string' ? normalizeEmailInput(email) : '';
+	if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+		res.status(400).json({ success: false, message: 'A valid email is required.' });
+		return;
+	}
+
+	const verificationTokenValue = verificationToken();
+	const user = await User.create({
+		name: name ?? '',
+		email: normalizedEmail,
+		username: username ?? '',
+		adminNo: await generateUniqueAdminNo(),
+		passwordHash: await argon2.hash(password),
+		isAdmin: false,
+		email_verified: false,
+		verfication_token: verificationTokenValue,
+		verfication_token_expiress: new Date(Date.now() + 15 * 60 * 1000),
+		userType:userType
+	});
+
+	try {
+		await enqueueVerificationEmail({
+			email: user.email,
+			verificationToken: verificationTokenValue,
+			name: user.name,
+		});
+	} catch (error: unknown) {
+		console.error('Email verification enqueue failed:', error);
+		await user.destroy();
+		res.status(502).json({
+			success: false,
+			message: 'Registration could not be completed because the verification email could not be queued.',
+		});
+		return;
+	}
+
+	res.status(201).json({
+		status: 'success',
+		success: true,
+		message: 'Registration successful. Please verify your email before logging in.',
+		emailQueued: true,
+	});
+}
 
 
+//transaction

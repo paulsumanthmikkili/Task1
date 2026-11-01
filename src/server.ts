@@ -3,6 +3,8 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import sequelize from './Config/db';
 import routes from './Routes/Routes';
+import { startEmailWorker } from './Workers/emailWorker';
+import { attachSessionSockets, disconnectAllSessionSockets } from './Authentication/Session';
 
 // dotenv.config();
 
@@ -17,7 +19,29 @@ const port = Number(process.env.PORT ?? 3000);
 if (require.main === module) {
     sequelize.authenticate()
         .then(() => sequelize.sync({ alter: true }))
-        .then(() => app.listen(port, () => console.log(`API listening on port ${port}`)))
+        .then(() => {
+            const emailWorker = startEmailWorker();
+            const server = app.listen(port, () => console.log(`API listening on port ${port}`));
+            attachSessionSockets(server);
+
+            const shutdown = async (): Promise<void> => {
+                await emailWorker.close();
+                disconnectAllSessionSockets();
+                await new Promise<void>((resolve, reject) => {
+                    server.close((error) => error ? reject(error) : resolve());
+                });
+                await sequelize.close();
+            };
+            const handleShutdown = (): void => {
+                void shutdown().catch((error: unknown) => {
+                    console.error('Unable to shut down cleanly:', error);
+                    process.exitCode = 1;
+                });
+            };
+
+            process.once('SIGINT', handleShutdown);
+            process.once('SIGTERM', handleShutdown);
+        })
         .catch((error: unknown) => {
             console.error('Unable to start API:', error);
             process.exitCode = 1;
