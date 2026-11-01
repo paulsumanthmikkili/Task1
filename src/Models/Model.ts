@@ -14,6 +14,17 @@ export class User extends Model<InferAttributes<User>, InferCreationAttributes<U
 	declare adminNo: string;
 	declare passwordHash: string;
 	declare isAdmin: boolean;
+	declare currentSessionId: string | null;
+	declare userType:CreationOptional<string>
+}
+
+export class PendingLogin extends Model<InferAttributes<PendingLogin>, InferCreationAttributes<PendingLogin>> {
+	declare id: string;
+	declare userId: number;
+	declare activeSessionId: string;
+	declare requestedSessionId: string;
+	declare status: 'pending' | 'approved' | 'denied' | 'expired';
+	declare expiresAt: Date;
 }
 
 User.init(
@@ -30,6 +41,24 @@ User.init(
 		adminNo: { type: DataTypes.STRING(4), allowNull: false, unique: true },
 		passwordHash: { type: DataTypes.STRING(255), allowNull: false },
 		isAdmin: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+		currentSessionId: { type: DataTypes.STRING(64), allowNull: true },
+		userType:{type:DataTypes.STRING}
 	},
 	{ sequelize, tableName: 'users', underscored: true, timestamps: true },
+);
+
+PendingLogin.init(
+	{
+		id: { type: DataTypes.UUID, primaryKey: true },
+		userId: { type: DataTypes.INTEGER, allowNull: false },
+		activeSessionId: { type: DataTypes.STRING(64), allowNull: false },
+		requestedSessionId: { type: DataTypes.STRING(64), allowNull: false },
+		status: {
+			type: DataTypes.ENUM('pending', 'approved', 'denied', 'expired'),
+			allowNull: false,
+			defaultValue: 'pending',
+		},
+		expiresAt: { type: DataTypes.DATE, allowNull: false },
+	},
+	{ sequelize, tableName: 'pending_logins', underscored: true, timestamps: true },
 );

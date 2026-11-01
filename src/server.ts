@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import sequelize from './Config/db';
 import routes from './Routes/Routes';
 import { startEmailWorker } from './Workers/emailWorker';
+import { attachSessionSockets, disconnectAllSessionSockets } from './Authentication/Session';
 
 // dotenv.config();
 
@@ -21,9 +22,11 @@ if (require.main === module) {
         .then(() => {
             const emailWorker = startEmailWorker();
             const server = app.listen(port, () => console.log(`API listening on port ${port}`));
+            attachSessionSockets(server);
 
             const shutdown = async (): Promise<void> => {
                 await emailWorker.close();
+                disconnectAllSessionSockets();
                 await new Promise<void>((resolve, reject) => {
                     server.close((error) => error ? reject(error) : resolve());
                 });

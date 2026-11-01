@@ -6,6 +6,10 @@ import { User } from '../Models/Model';
 import crypto from 'crypto';
 import { enqueuePasswordChangedEmail, enqueuePasswordResetEmail, enqueueVerificationEmail } from '../Queues/emailQueue';
 import {createClient} from 'redis';
+import { requestLoginApproval, terminateUserSessionSockets } from '../Authentication/Session';
+import { PendingLogin } from '../Models/Model';
+import sequelize from '../Config/db';
+import { micro } from '../microServices/micro';
 
 const client = createClient({ url: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379' });
 client.connect().then((res)=>console.log(`redis connected sucessfully`,res)).catch((err)=>console.log(`failed to connect redis`,err));
@@ -155,12 +159,178 @@ export async function loginController(req: Request, res: Response): Promise<void
 		});
 		return;
 	}
+	const requestedSessionId = crypto.randomUUID();
+	const loginRequest = await sequelize.transaction(async (transaction) => {
+		const currentUser = await User.findByPk(user.id, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!currentUser) {
+			return { kind: 'missing' as const };
+		}
+
+		if (currentUser.currentSessionId) {
+			const pending = await PendingLogin.create({
+				id: crypto.randomUUID(),
+				userId: currentUser.id,
+				activeSessionId: currentUser.currentSessionId,
+				requestedSessionId,
+				status: 'pending',
+				expiresAt: new Date(Date.now() + 2 * 60 * 1000),
+			}, { transaction });
+			return { kind: 'pending' as const, pending };
+		}
+
+		currentUser.currentSessionId = requestedSessionId;
+		await currentUser.save({ transaction });
+		return { kind: 'login' as const, currentUser };
+	});
+
+	if (loginRequest.kind === 'missing') {
+		res.status(404).json({ status: 'failed', success: false, message: 'User not found.' });
+		return;
+	}
+
+	if (loginRequest.kind === 'pending') {
+		requestLoginApproval(user.id, loginRequest.pending.activeSessionId, {
+			requestId: loginRequest.pending.id,
+			expiresAt: loginRequest.pending.expiresAt,
+		});
+		res.status(202).json({
+			status: 'pending',
+			success: true,
+			message: 'Sign-in approval was requested on your active device.',
+			data: { requestId: loginRequest.pending.id, expiresAt: loginRequest.pending.expiresAt },
+		});
+		return;
+	}
+	console.log(signToken(loginRequest.currentUser))
 	res.json({
 		status:"success",
 		success: true,
 		message: 'Login successful.',
-		data: { Acesstoken: signToken(user),RefreshToken:RefreshToken(user) ,user: { id: user.id, adminNo: user.adminNo, name: user.name, email: user.email, username: user.username, isAdmin: user.isAdmin } },
+		data: { Acesstoken: signToken(loginRequest.currentUser),RefreshToken:RefreshToken(loginRequest.currentUser) ,user: { id: loginRequest.currentUser.id, adminNo: loginRequest.currentUser.adminNo, name: loginRequest.currentUser.name, email: loginRequest.currentUser.email, username: loginRequest.currentUser.username, isAdmin: loginRequest.currentUser.isAdmin } },
 	});
+}
+
+export async function loginDecisionController(req: AuthenticatedRequest, res: Response): Promise<void> {
+	const requestId = req.body?.requestId;
+	const decision = req.body?.decision;
+	if (typeof requestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(requestId) ||
+		(decision !== 'grant' && decision !== 'cancel')) {
+		res.status(400).json({ success: false, message: 'A valid requestId and decision ("grant" or "cancel") are required.' });
+		return;
+	}
+
+	const result = await sequelize.transaction(async (transaction) => {
+		const pending = await PendingLogin.findByPk(requestId, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!pending || pending.userId !== req.user!.userId) {
+			return { status: 'not-found' as const };
+		}
+
+		if (pending.status !== 'pending') {
+			return { status: 'already-handled' as const, previousStatus: pending.status };
+		}
+
+		const user = await User.findByPk(pending.userId, {
+			transaction,
+			lock: transaction.LOCK.UPDATE,
+		});
+		if (!user || user.currentSessionId !== req.user!.sessionId ||
+			user.currentSessionId !== pending.activeSessionId) {
+			pending.status = 'expired';
+			await pending.save({ transaction });
+			return { status: 'expired' as const };
+		}
+
+		if (pending.expiresAt.getTime() <= Date.now()) {
+			pending.status = 'expired';
+			await pending.save({ transaction });
+			return { status: 'expired' as const };
+		}
+
+		if (decision === 'cancel') {
+			pending.status = 'denied';
+			await pending.save({ transaction });
+			return { status: 'denied' as const };
+		}
+
+		user.currentSessionId = pending.requestedSessionId;
+		await user.save({ transaction });
+		pending.status = 'approved';
+		await pending.save({ transaction });
+		return { status: 'approved' as const, oldSessionId: pending.activeSessionId };
+	});
+
+	if (result.status === 'approved') {
+		terminateUserSessionSockets(req.user!.userId, result.oldSessionId);
+		res.status(200).json({ success: true, status: 'approved', message: 'Sign-in approved. Your current session has been signed out.' });
+		return;
+	}
+	if (result.status === 'not-found') {
+		res.status(404).json({ success: false, status: 'not-found', message: 'Login request not found.' });
+		return;
+	}
+	if (result.status === 'denied') {
+		res.status(200).json({ success: true, status: 'denied', message: 'Sign-in request cancelled.' });
+		return;
+	}
+	if (result.status === 'expired') {
+		res.status(410).json({ success: false, status: 'expired', message: 'Sign-in request expired or is no longer valid.' });
+		return;
+	}
+	res.status(409).json({
+		success: false,
+		status: 'already-handled',
+		requestStatus: result.previousStatus,
+		message: 'Sign-in request has already been handled.',
+	});
+}
+
+export async function loginStatusController(req: Request, res: Response): Promise<void> {
+	const requestId = req.params.requestId;
+	if (typeof requestId !== 'string' || !/^[0-9a-f-]{36}$/i.test(requestId)) {
+		res.status(400).json({ success: false, message: 'A valid login request ID is required.' });
+		return;
+	}
+
+	const pending = await PendingLogin.findByPk(requestId);
+	if (!pending) {
+		res.status(404).json({ success: false, status: 'not-found', message: 'Login request not found.' });
+		return;
+	}
+	if (pending.status === 'pending' && pending.expiresAt.getTime() <= Date.now()) {
+		pending.status = 'expired';
+		await pending.save();
+	}
+
+	if (pending.status === 'approved') {
+		const user = await User.findByPk(pending.userId);
+		if (!user || user.currentSessionId !== pending.requestedSessionId) {
+			res.status(409).json({ success: false, status: 'superseded', message: 'This approved sign-in was replaced by a newer session.' });
+			return;
+		}
+		res.status(200).json({
+			success: true,
+			status: 'approved',
+			message: 'Sign-in approved.',
+			data: {
+				Acesstoken: signToken(user),
+				RefreshToken: RefreshToken(user),
+				user: { id: user.id, adminNo: user.adminNo, name: user.name, email: user.email, username: user.username, isAdmin: user.isAdmin },
+			},
+		});
+		return;
+	}
+
+	if (pending.status === 'pending') {
+		res.status(202).json({ success: true, status: 'pending', expiresAt: pending.expiresAt });
+		return;
+	}
+	res.status(200).json({ success: true, status: pending.status });
 }
 
 export async function dashboardController(req: AuthenticatedRequest, res: Response): Promise<void> {
@@ -298,7 +468,7 @@ export async function updateUserDetailsController(req: AuthenticatedRequest, res
 		user.email = nextEmail;
 		user.email_verified = false;
 		user.verfication_token = verificationToken();
-		user.verfication_token_expiress = new Date(Date.now() + 15 * 60 * 1000);
+		user.verfication_token_expiress = new Date(Date.now() + 25 * 60 * 1000);
 	}
 	await user.save();
 	await refreshUserCache(user);
@@ -401,3 +571,60 @@ export async function getuserwithid(req: Request, res: Response): Promise<void> 
 		data,
 	});
 }
+
+export async function MicroserviceRegisterController(req: Request, res: Response): Promise<void> {
+	const data=await micro();
+	console.log(data)
+	const { name, email, username, password,userType } = data;
+
+	if (typeof password !== 'string') {
+		res.status(400).json({ success: false, message: 'Password is required.' });
+		return;
+	}
+
+	const normalizedEmail = typeof email === 'string' ? normalizeEmailInput(email) : '';
+	if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+		res.status(400).json({ success: false, message: 'A valid email is required.' });
+		return;
+	}
+
+	const verificationTokenValue = verificationToken();
+	const user = await User.create({
+		name: name ?? '',
+		email: normalizedEmail,
+		username: username ?? '',
+		adminNo: await generateUniqueAdminNo(),
+		passwordHash: await argon2.hash(password),
+		isAdmin: false,
+		email_verified: false,
+		verfication_token: verificationTokenValue,
+		verfication_token_expiress: new Date(Date.now() + 15 * 60 * 1000),
+		userType:userType
+	});
+
+	try {
+		await enqueueVerificationEmail({
+			email: user.email,
+			verificationToken: verificationTokenValue,
+			name: user.name,
+		});
+	} catch (error: unknown) {
+		console.error('Email verification enqueue failed:', error);
+		await user.destroy();
+		res.status(502).json({
+			success: false,
+			message: 'Registration could not be completed because the verification email could not be queued.',
+		});
+		return;
+	}
+
+	res.status(201).json({
+		status: 'success',
+		success: true,
+		message: 'Registration successful. Please verify your email before logging in.',
+		emailQueued: true,
+	});
+}
+
+
+//transaction
